@@ -1,4 +1,6 @@
 from __future__ import annotations
+import sqlite3
+
 from app.db import connect
 
 SCHEMA = '''
@@ -50,7 +52,11 @@ CREATE TABLE IF NOT EXISTS reconcile_batches (
   variance_count INTEGER NOT NULL,
   status TEXT NOT NULL,
   sealed_at TEXT,
-  note TEXT
+  note TEXT,
+  kind TEXT NOT NULL DEFAULT 'baseline',
+  corrects_batch_id INTEGER,
+  corrects_batch_no TEXT,
+  materialized_at TEXT
 );
 CREATE TABLE IF NOT EXISTS match_rows (
   id INTEGER PRIMARY KEY,
@@ -61,7 +67,9 @@ CREATE TABLE IF NOT EXISTS match_rows (
   expect_qty REAL NOT NULL,
   receive_qty REAL NOT NULL,
   confirm_qty REAL NOT NULL,
-  aligned INTEGER NOT NULL
+  aligned INTEGER NOT NULL,
+  changed INTEGER NOT NULL DEFAULT 0,
+  origin TEXT NOT NULL DEFAULT 'baseline'
 );
 CREATE TABLE IF NOT EXISTS variance_rows (
   id INTEGER PRIMARY KEY,
@@ -73,7 +81,34 @@ CREATE TABLE IF NOT EXISTS variance_rows (
   receive_qty REAL NOT NULL,
   confirm_qty REAL NOT NULL,
   fate TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  bucket TEXT NOT NULL DEFAULT 'three_way',
+  origin TEXT NOT NULL DEFAULT 'baseline',
+  carried_from_id INTEGER
+);
+CREATE TABLE IF NOT EXISTS correction_lines (
+  id INTEGER PRIMARY KEY,
+  correction_no TEXT NOT NULL UNIQUE,
+  batch_id INTEGER NOT NULL REFERENCES reconcile_batches(id) ON DELETE RESTRICT,
+  dock_day TEXT NOT NULL,
+  supplier_code TEXT NOT NULL,
+  sku TEXT NOT NULL,
+  leg TEXT NOT NULL,
+  prev_qty REAL NOT NULL,
+  new_qty REAL NOT NULL,
+  delta REAL NOT NULL,
+  reason TEXT,
+  note TEXT,
   created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS batch_snapshots (
+  id INTEGER PRIMARY KEY,
+  batch_id INTEGER NOT NULL REFERENCES reconcile_batches(id) ON DELETE CASCADE,
+  batch_no TEXT NOT NULL,
+  stage TEXT NOT NULL,
+  fingerprint TEXT NOT NULL,
+  captured_at TEXT NOT NULL,
+  note TEXT
 );
 CREATE TABLE IF NOT EXISTS late_spill (
   id INTEGER PRIMARY KEY,
@@ -85,13 +120,102 @@ CREATE TABLE IF NOT EXISTS reopen_requests (
   dock_day TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'none'
 );
+CREATE INDEX IF NOT EXISTS idx_match_batch ON match_rows(batch_id);
+CREATE INDEX IF NOT EXISTS idx_var_batch ON variance_rows(batch_id);
+CREATE INDEX IF NOT EXISTS idx_corr_batch ON correction_lines(batch_id);
+CREATE INDEX IF NOT EXISTS idx_snap_batch ON batch_snapshots(batch_id);
 '''
+
+# Columns added after the first schema version.  Every entry is (table, column, ddl).
+MIGRATIONS: list[tuple[str, str, str]] = [
+    ("reconcile_batches", "kind", "TEXT NOT NULL DEFAULT 'baseline'"),
+    ("reconcile_batches", "corrects_batch_id", "INTEGER"),
+    ("reconcile_batches", "corrects_batch_no", "TEXT"),
+    ("reconcile_batches", "materialized_at", "TEXT"),
+    ("match_rows", "changed", "INTEGER NOT NULL DEFAULT 0"),
+    ("match_rows", "origin", "TEXT NOT NULL DEFAULT 'baseline'"),
+    ("variance_rows", "bucket", "TEXT NOT NULL DEFAULT 'three_way'"),
+    ("variance_rows", "origin", "TEXT NOT NULL DEFAULT 'baseline'"),
+    ("variance_rows", "carried_from_id", "INTEGER"),
+]
+
+# Defence in depth: even a code path that forgets its gate cannot mutate a
+# sealed batch's detail rows.  The app-level gate runs first; these triggers are
+# the last line that keeps "sealed" true under concurrency and bugs.
+GUARDS = '''
+CREATE TRIGGER IF NOT EXISTS trg_match_rows_sealed_ins
+BEFORE INSERT ON match_rows
+FOR EACH ROW WHEN (SELECT status FROM reconcile_batches WHERE id=NEW.batch_id)='sealed'
+BEGIN SELECT RAISE(ABORT, 'sealed batch detail is read-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_match_rows_sealed_upd
+BEFORE UPDATE ON match_rows
+FOR EACH ROW WHEN (SELECT status FROM reconcile_batches WHERE id=OLD.batch_id)='sealed'
+BEGIN SELECT RAISE(ABORT, 'sealed batch detail is read-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_match_rows_sealed_del
+BEFORE DELETE ON match_rows
+FOR EACH ROW WHEN (SELECT status FROM reconcile_batches WHERE id=OLD.batch_id)='sealed'
+BEGIN SELECT RAISE(ABORT, 'sealed batch detail is read-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_variance_rows_sealed_ins
+BEFORE INSERT ON variance_rows
+FOR EACH ROW WHEN (SELECT status FROM reconcile_batches WHERE id=NEW.batch_id)='sealed'
+BEGIN SELECT RAISE(ABORT, 'sealed batch detail is read-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_variance_rows_sealed_upd
+BEFORE UPDATE ON variance_rows
+FOR EACH ROW WHEN (SELECT status FROM reconcile_batches WHERE id=OLD.batch_id)='sealed'
+BEGIN SELECT RAISE(ABORT, 'sealed batch detail is read-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_variance_rows_sealed_del
+BEFORE DELETE ON variance_rows
+FOR EACH ROW WHEN (SELECT status FROM reconcile_batches WHERE id=OLD.batch_id)='sealed'
+BEGIN SELECT RAISE(ABORT, 'sealed batch detail is read-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_correction_lines_sealed_ins
+BEFORE INSERT ON correction_lines
+FOR EACH ROW WHEN (SELECT status FROM reconcile_batches WHERE id=NEW.batch_id)='sealed'
+BEGIN SELECT RAISE(ABORT, 'sealed batch detail is read-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_correction_lines_sealed_upd
+BEFORE UPDATE ON correction_lines
+FOR EACH ROW WHEN (SELECT status FROM reconcile_batches WHERE id=OLD.batch_id)='sealed'
+BEGIN SELECT RAISE(ABORT, 'sealed batch detail is read-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_correction_lines_sealed_del
+BEFORE DELETE ON correction_lines
+FOR EACH ROW WHEN (SELECT status FROM reconcile_batches WHERE id=OLD.batch_id)='sealed'
+BEGIN SELECT RAISE(ABORT, 'sealed batch detail is read-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_batches_sealed_upd
+BEFORE UPDATE ON reconcile_batches
+FOR EACH ROW WHEN OLD.status='sealed'
+BEGIN SELECT RAISE(ABORT, 'sealed batch is read-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_batches_sealed_del
+BEFORE DELETE ON reconcile_batches
+FOR EACH ROW WHEN OLD.status='sealed'
+BEGIN SELECT RAISE(ABORT, 'sealed batch is read-only'); END;
+'''
+
+
+def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def migrate(conn: sqlite3.Connection) -> None:
+    for table, column, ddl in MIGRATIONS:
+        if column not in _columns(conn, table):
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+    conn.executescript(GUARDS)
 
 
 def seed_if_empty() -> None:
     conn = connect()
     try:
         conn.executescript(SCHEMA)
+        migrate(conn)
         if conn.execute("SELECT COUNT(*) c FROM suppliers").fetchone()["c"]:
             return
         conn.execute("INSERT INTO settings(key, value) VALUES ('dock_day', ?)", ("2026-11-18",))

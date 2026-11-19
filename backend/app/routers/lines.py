@@ -2,7 +2,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
-from app.db import connect
+from app.db import connect, write_tx
 from app.services.gate import assert_writable
 
 router = APIRouter(tags=["lines"])
@@ -68,13 +68,14 @@ def list_expects(dock_day: str | None = None):
 def add_expect(body: ExpectIn):
     conn = connect()
     try:
-        assert_writable(conn, body.dock_day)
-        conn.execute(
-            '''INSERT INTO expect_lines(doc_no, supplier_code, sku, dock_day, qty, note, created_at)
-               VALUES (?,?,?,?,?,?,?)''',
-            (body.doc_no, body.supplier_code, body.sku, body.dock_day, body.qty, body.note, _now()),
-        )
-        conn.commit()
+        with write_tx(conn):
+            # the sealed gate runs inside the same write lock as the insert
+            assert_writable(conn, body.dock_day)
+            conn.execute(
+                '''INSERT INTO expect_lines(doc_no, supplier_code, sku, dock_day, qty, note, created_at)
+                   VALUES (?,?,?,?,?,?,?)''',
+                (body.doc_no, body.supplier_code, body.sku, body.dock_day, body.qty, body.note, _now()),
+            )
         return {"ok": True}
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
@@ -103,23 +104,23 @@ def list_receives(dock_day: str | None = None):
 def add_receive(body: ReceiveIn):
     conn = connect()
     try:
-        assert_writable(conn, body.dock_day)
-        occurred = body.occurred_at or _now()
-        conn.execute(
-            '''INSERT INTO receive_lines(receive_no, supplier_code, sku, dock_day, qty, occurred_at, note, created_at)
-               VALUES (?,?,?,?,?,?,?,?)''',
-            (
-                body.receive_no,
-                body.supplier_code,
-                body.sku,
-                body.dock_day,
-                body.qty,
-                occurred,
-                body.note,
-                _now(),
-            ),
-        )
-        conn.commit()
+        with write_tx(conn):
+            assert_writable(conn, body.dock_day)
+            occurred = body.occurred_at or _now()
+            conn.execute(
+                '''INSERT INTO receive_lines(receive_no, supplier_code, sku, dock_day, qty, occurred_at, note, created_at)
+                   VALUES (?,?,?,?,?,?,?,?)''',
+                (
+                    body.receive_no,
+                    body.supplier_code,
+                    body.sku,
+                    body.dock_day,
+                    body.qty,
+                    occurred,
+                    body.note,
+                    _now(),
+                ),
+            )
         return {"ok": True}
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
@@ -148,13 +149,13 @@ def list_confirms(dock_day: str | None = None):
 def add_confirm(body: ConfirmIn):
     conn = connect()
     try:
-        assert_writable(conn, body.dock_day)
-        conn.execute(
-            '''INSERT INTO confirm_lines(confirm_no, supplier_code, sku, dock_day, qty, note, created_at)
-               VALUES (?,?,?,?,?,?,?)''',
-            (body.confirm_no, body.supplier_code, body.sku, body.dock_day, body.qty, body.note, _now()),
-        )
-        conn.commit()
+        with write_tx(conn):
+            assert_writable(conn, body.dock_day)
+            conn.execute(
+                '''INSERT INTO confirm_lines(confirm_no, supplier_code, sku, dock_day, qty, note, created_at)
+                   VALUES (?,?,?,?,?,?,?)''',
+                (body.confirm_no, body.supplier_code, body.sku, body.dock_day, body.qty, body.note, _now()),
+            )
         return {"ok": True}
     except ValueError as e:
         raise HTTPException(400, str(e)) from e

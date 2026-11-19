@@ -12,6 +12,7 @@
       </div>
       <p class="msg">{{ err }}</p>
       <p class="okmsg">{{ ok }}</p>
+      <p class="hint">已结案后才发现错数？不要改原批明细，请到 <router-link class="link" to="/reconcile">三联对账</router-link> 开订正批。</p>
       <table>
         <thead><tr><th>实收号</th><th>供应商</th><th>货号</th><th>到货日</th><th>数量</th></tr></thead>
         <tbody>
